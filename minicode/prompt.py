@@ -90,6 +90,9 @@ def build_system_prompt(
     cwd: str,
     permission_summary: list[str] | None = None,
     extras: dict | None = None,
+    *,
+    routing_confidence: float | None = None,
+    is_routed: bool = False,
 ) -> str:
     cwd_path = Path(cwd)
     permission_summary = permission_summary or []
@@ -123,22 +126,45 @@ def build_system_prompt(
     if permission_summary:
         parts.append("Permission context:\n" + "\n".join(permission_summary))
 
+    # Self-evolving memory: inject relevant past experience
+    relevant_memories = extras.get("relevant_memories", [])
+    if relevant_memories:
+        parts.append(
+            "Relevant past experience (auto-extracted from previous sessions):\n"
+            + "\n".join(
+                f"- [{m.category}] {m.content}" if hasattr(m, 'category')
+                else f"- {m.get('category', 'general')}: {m.get('content', str(m))}"
+                for m in relevant_memories
+            )
+        )
+
     skills = extras.get("skills", [])
     if skills:
-        parts.append(
-            "Available skills:\n"
-            + "\n".join(f"- {skill['name']}: {skill['description']}" for skill in skills)
-            + "\n\n"
-            + "SKILL USAGE GUIDE:\n"
-            + "- When user asks for creative brainstorming, use 'brainstorming' skill\n"
-            + "- When writing implementation plans, use 'writing-plans' skill\n"
-            + "- When debugging systematically, use 'systematic-debugging' skill\n"
-            + "- When doing TDD, use 'test-driven-development' skill\n"
-            + "- When reviewing code in Chinese, use 'chinese-code-review' skill\n"
-            + "- When user asks about workflows, check 'using-superpowers' skill first\n"
-            + "- For complex multi-step tasks, consider 'subagent-driven-development'\n"
-            + "- Before completing, ALWAYS use 'verification-before-completion'"
-        )
+        if is_routed and routing_confidence is not None:
+            # Routed mode: show only top-matched skills
+            parts.append(
+                "Relevant skills (auto-matched to your request):\n"
+                + "\n".join(
+                    f"- {skill['name']} [{skill.get('layer', 'unknown')}]: {skill['description']}"
+                    for skill in skills
+                )
+                + f"\n\n(Matching confidence: {routing_confidence:.0%})"
+                + "\nTo see all available skills, use /skills"
+            )
+        else:
+            # Full listing: all discovered skills
+            parts.append(
+                "Available skills:\n"
+                + "\n".join(
+                    f"- {skill['name']} [{skill.get('layer', 'unknown')}]: {skill['description']}"
+                    for skill in skills
+                )
+            )
+            parts.append(
+                "To use a skill, call load_skill with the skill name. "
+                "If the user names a skill or clearly asks for a workflow "
+                "that matches a listed skill, call load_skill before following it."
+            )
     else:
         parts.append(
             "Available skills:\n"
@@ -188,5 +214,15 @@ def build_system_prompt(
         parts.append(f"Global instructions from ~/.claude/CLAUDE.md:\n{global_claude_md}")
     if project_claude_md:
         parts.append(f"Project instructions from {cwd_path / 'CLAUDE.md'}:\n{project_claude_md}")
+
+    # ── Cache-Friendly Structuring (Layer 2) ──
+    # Wrap static prefix with cache_control markers so the Anthropic API
+    # can cache the immutable portion across turns, reducing input cost.
+    try:
+        from minicode.layered_context import PromptCacheOptimizer
+        optimizer = PromptCacheOptimizer()
+        parts, static_count = optimizer.wrap_static(parts)
+    except Exception:
+        pass  # cache optimization is best-effort
 
     return "\n\n".join(parts)

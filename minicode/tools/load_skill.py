@@ -16,18 +16,23 @@ def create_load_skill_tool(cwd: str) -> ToolDefinition:
         skill = load_skill(cwd, input_data["name"])
         if skill is None:
             return ToolResult(ok=False, output=f"Unknown skill: {input_data['name']}")
-        return ToolResult(
-            ok=True,
-            output="\n".join(
-                [
-                    f"SKILL: {skill.name}",
-                    f"SOURCE: {skill.source}",
-                    f"PATH: {skill.path}",
-                    "",
-                    skill.content,
-                ]
-            ),
-        )
+        parts = [
+            f"SKILL: {skill.name}",
+            f"SOURCE: {skill.source}",
+            f"PATH: {skill.path}",
+        ]
+        if skill.layer != "unknown":
+            parts.append(f"LAYER: {skill.layer}")
+        if skill.frontmatter:
+            fm = skill.frontmatter
+            if fm.domain != "general":
+                parts.append(f"DOMAIN: {fm.domain}")
+            if fm.tags:
+                parts.append(f"TAGS: {', '.join(fm.tags)}")
+            if fm.version:
+                parts.append(f"VERSION: {fm.version}")
+        parts.extend(["", skill.content])
+        return ToolResult(ok=True, output="\n".join(parts))
 
     return ToolDefinition(
         name="load_skill",

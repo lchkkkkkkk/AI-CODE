@@ -32,18 +32,40 @@ class MemoryScope(str, Enum):
     LOCAL = "local"     # Project-local, .mini-code-memory-local/
 
 
+# Self-evolving memory categories
+MEMORY_CATEGORIES: dict[str, str] = {
+    "error_pattern":     "从失败中提取的修复经验",
+    "code_convention":   "项目代码规范和模式",
+    "user_preference":   "用户偏好和习惯",
+    "tool_usage":        "工具使用经验和最佳实践",
+    "project_insight":   "项目结构和架构洞察",
+    "architecture":      "架构决策",
+    "convention":        "编码约定",
+    "decision":          "决策记录",
+    "pattern":           "设计模式",
+    "general":           "通用记忆",
+}
+
+
 @dataclass
 class MemoryEntry:
-    """A single memory entry (fact, pattern, decision, etc.)."""
+    """A single memory entry with self-evolving support."""
     id: str
     scope: MemoryScope
-    category: str  # e.g., "architecture", "convention", "decision", "pattern"
+    category: str
     content: str
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     tags: list[str] = field(default_factory=list)
-    usage_count: int = 0  # How often this was referenced
-    
+    usage_count: int = 0
+    # Self-evolving memory fields
+    source_type: str = "manual"       # "manual" | "auto_reflection" | "auto_pattern"
+    confidence: float = 1.0           # 0.0 – 1.0, auto-extracted memories start lower
+    decay_rate: float = 0.0           # confidence decay per decay-tick (0 = no decay)
+    last_accessed_at: float = 0.0     # timestamp of last retrieval
+    source_session_id: str = ""       # session that created this memory
+    revision_count: int = 0           # how many times this entry has been updated
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -55,11 +77,17 @@ class MemoryEntry:
             "updated_at": self.updated_at,
             "tags": self.tags,
             "usage_count": self.usage_count,
+            "source_type": self.source_type,
+            "confidence": self.confidence,
+            "decay_rate": self.decay_rate,
+            "last_accessed_at": self.last_accessed_at,
+            "source_session_id": self.source_session_id,
+            "revision_count": self.revision_count,
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryEntry":
-        """Create from dictionary."""
+        """Create from dictionary with backward compatibility for old formats."""
         return cls(
             id=data["id"],
             scope=MemoryScope(data.get("scope", "user")),
@@ -69,6 +97,12 @@ class MemoryEntry:
             updated_at=data.get("updated_at", time.time()),
             tags=data.get("tags", []),
             usage_count=data.get("usage_count", 0),
+            source_type=data.get("source_type", "manual"),
+            confidence=data.get("confidence", 1.0),
+            decay_rate=data.get("decay_rate", 0.0),
+            last_accessed_at=data.get("last_accessed_at", 0.0),
+            source_session_id=data.get("source_session_id", ""),
+            revision_count=data.get("revision_count", 0),
         )
 
 
@@ -122,6 +156,67 @@ class MemoryFile:
                 results.append(entry)
         return results
     
+    def dedup_entry(self, content: str, threshold: float = 0.7) -> MemoryEntry | None:
+        """Check for an existing entry with similar content.
+
+        Uses simple token-overlap Jaccard similarity; returns the
+        best-matching entry whose similarity >= *threshold*, or None.
+        """
+        if not content or not self.entries:
+            return None
+        tokens_a = set(content.lower().split())
+        best: MemoryEntry | None = None
+        best_score = 0.0
+        for entry in self.entries:
+            tokens_b = set(entry.content.lower().split())
+            if not tokens_a or not tokens_b:
+                continue
+            intersection = tokens_a & tokens_b
+            union = tokens_a | tokens_b
+            score = len(intersection) / max(len(union), 1)
+            if score >= threshold and score > best_score:
+                best_score = score
+                best = entry
+        return best
+
+    def update_or_add(self, entry: MemoryEntry) -> MemoryEntry:
+        """Insert *entry*, or merge into an existing similar entry.
+
+        When a similar entry exists: increment its ``revision_count``,
+        boost ``confidence``, update ``content`` and ``tags``.
+        Otherwise append as a new entry.
+        """
+        existing = self.dedup_entry(entry.content)
+        if existing is not None:
+            existing.content = entry.content
+            existing.tags = list(set(existing.tags + entry.tags))
+            existing.updated_at = time.time()
+            existing.revision_count += 1
+            existing.confidence = min(1.0, existing.confidence + 0.1)
+            return existing
+        self.add_entry(entry)
+        return entry
+
+    def apply_decay(self, min_confidence: float = 0.3) -> int:
+        """Reduce confidence of entries whose decay_rate > 0.
+
+        Entries that drop below *min_confidence* are removed.
+        Returns the number of entries pruned.
+        """
+        now = time.time()
+        pruned = 0
+        survivors: list[MemoryEntry] = []
+        for entry in self.entries:
+            if entry.decay_rate > 0 and entry.last_accessed_at > 0:
+                ticks = max(0, (now - entry.last_accessed_at) / 86400)  # days
+                entry.confidence -= entry.decay_rate * ticks
+                if entry.confidence < min_confidence:
+                    pruned += 1
+                    continue
+            survivors.append(entry)
+        self.entries = survivors
+        return pruned
+
     def _enforce_limits(self) -> None:
         """Remove oldest entries if exceeding limits."""
         # Check entry count
@@ -436,6 +531,57 @@ class MemoryManager:
         
         return "\n".join(lines)
     
+    def search_by_category(self, category: str, limit: int = 20) -> list[MemoryEntry]:
+        """Return entries of *category* sorted by confidence desc, then usage desc."""
+        results: list[MemoryEntry] = []
+        for scope in MemoryScope:
+            results.extend(self.memories[scope].get_entries_by_category(category))
+        results.sort(key=lambda e: (e.confidence, e.usage_count), reverse=True)
+        return results[:limit]
+
+    def search_relevant(self, query: str, limit: int = 5) -> list[MemoryEntry]:
+        """Keyword-based relevant memory retrieval.
+
+        Returns memories ranked by a composite score:
+        (token_overlap * 0.5 + confidence * 0.3 + usage_factor * 0.2).
+        """
+        if not query:
+            return []
+        query_tokens = set(query.lower().split())
+        scored: list[tuple[float, MemoryEntry]] = []
+        for scope in MemoryScope:
+            for entry in self.memories[scope].entries:
+                entry_tokens = set(entry.content.lower().split())
+                if not query_tokens or not entry_tokens:
+                    continue
+                overlap = len(query_tokens & entry_tokens)
+                jaccard = overlap / max(len(query_tokens | entry_tokens), 1)
+                usage_factor = min(1.0, entry.usage_count / 10.0)
+                score = jaccard * 0.5 + entry.confidence * 0.3 + usage_factor * 0.2
+                if score > 0.05:
+                    scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for _, entry in scored[:limit]:
+            self.touch_entry(entry.id)
+        return [e for _, e in scored[:limit]]
+
+    def touch_entry(self, entry_id: str) -> None:
+        """Record that *entry_id* was accessed (updates usage + timestamp)."""
+        for scope in MemoryScope:
+            for entry in self.memories[scope].entries:
+                if entry.id == entry_id:
+                    entry.usage_count += 1
+                    entry.last_accessed_at = time.time()
+                    return
+
+    def apply_decay_all(self, min_confidence: float = 0.3) -> int:
+        """Apply decay across all scopes and persist.  Returns total pruned."""
+        total = 0
+        for scope in MemoryScope:
+            total += self.memories[scope].apply_decay(min_confidence)
+            self._save_scope(scope)
+        return total
+
     def clear_scope(self, scope: MemoryScope) -> None:
         """Clear all entries in a scope."""
         self.memories[scope] = MemoryFile(scope=scope)

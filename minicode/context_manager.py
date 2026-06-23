@@ -199,83 +199,131 @@ class ContextManager:
         return stats.should_compact
     
     def compact_messages(self) -> list[dict[str, Any]]:
-        """Compact messages to fit within context window.
-        
-        Strategy:
-        1. Keep system prompt (always)
-        2. Keep recent messages (last N)
-        3. Summarize/condense older tool calls
-        4. Remove old assistant progress messages
+        """Compact messages with structured note summarisation.
+
+        Strategy (layered):
+        1. Keep system prompt (always).
+        2. Extract structured notes from tool results before dropping them.
+        3. Drop assistant_progress first, then tool-call/result pairs,
+           then plain user/assistant.
+        4. Insert a compaction boundary marker with actual summaries.
         """
         stats = self.get_stats()
         if not stats.should_compact:
             return self.messages
-        
-        # Calculate target: reduce to ~70% of context window
+
+        from minicode.layered_context import OverflowGovernor, NoteSummarizer
+
+        governor = OverflowGovernor()
+        summarizer = NoteSummarizer()
+
+        decision = governor.check(stats.usage_percentage / 100.0)
         target_tokens = int(self.context_window * 0.70)
-        
-        # Always keep system prompt
+
         system_messages = [m for m in self.messages if m.get("role") == "system"]
         other_messages = [m for m in self.messages if m.get("role") != "system"]
-        
-        # Remove old progress messages first
+
+        # Remove progress messages first
         filtered = [
             m for m in other_messages
             if m.get("role") != "assistant_progress"
         ]
-        
-        # If still too large, drop oldest messages one at a time.
-        # Prefer dropping tool-call/tool-result pairs first, then plain
-        # assistant/user messages.  Always keep the most recent messages.
-        while estimate_messages_tokens(filtered) > target_tokens and len(filtered) > MIN_MESSAGES_TO_KEEP:
+
+        # ── Structured note extraction BEFORE dropping ──────────
+        structured_notes: list[str] = []
+        removed_count = 0
+        tool_summary_buffer: list[dict] = []
+
+        while (estimate_messages_tokens(filtered) > target_tokens
+               and len(filtered) > MIN_MESSAGES_TO_KEEP):
             removed = False
             for i in range(len(filtered) - MIN_MESSAGES_TO_KEEP):
                 role = filtered[i].get("role")
-                # Drop tool-call + its result as a pair
+
                 if role == "assistant_tool_call":
-                    if (i + 1 < len(filtered) and
-                            filtered[i + 1].get("role") == "tool_result"):
+                    # Extract structured note from paired tool_result
+                    if (i + 1 < len(filtered)
+                            and filtered[i + 1].get("role") == "tool_result"):
+                        result_content = filtered[i + 1].get("content", "")
+                        if result_content and len(result_content) > 100:
+                            tool_name = filtered[i].get("toolName", "unknown")
+                            tool_id = filtered[i].get("toolUseId", "")
+                            note = summarizer.summarize(
+                                tool_name, tool_id, result_content)
+                            structured_notes.append(summarizer.format_note(note))
+                            tool_summary_buffer.append({
+                                "tool": tool_name,
+                                "summary": note.summary,
+                            })
                         del filtered[i:i + 2]
                     else:
                         del filtered[i]
                     removed = True
+                    removed_count += 1
                     break
-                # Drop standalone tool_result (orphaned)
+
                 if role == "tool_result":
+                    result_content = filtered[i].get("content", "")
+                    if result_content and len(result_content) > 100:
+                        tool_name = filtered[i].get("toolName", "unknown")
+                        tool_id = filtered[i].get("toolUseId", "")
+                        note = summarizer.summarize(
+                            tool_name, tool_id, result_content)
+                        structured_notes.append(summarizer.format_note(note))
                     del filtered[i]
                     removed = True
+                    removed_count += 1
                     break
-                # Drop plain user/assistant messages
+
                 if role in ("user", "assistant"):
                     del filtered[i]
                     removed = True
+                    removed_count += 1
                     break
 
             if not removed:
                 break
-        
-        # Add compaction marker
+
+        # ── Build compaction marker with REAL summaries ─────────
+        after_tokens = estimate_messages_tokens(filtered)
+        after_pct = after_tokens / self.context_window * 100
+        now_str = time.strftime("%H:%M:%S")
+
+        summary_block_lines = [
+            f"[Context compacted at {now_str} — {removed_count} messages absorbed]",
+            f"Token usage: {stats.usage_percentage:.0f}% → {after_pct:.0f}% "
+            f"({after_tokens:,}/{self.context_window:,})",
+            f"Suggestion: {decision.suggested_action} ({decision.reason})",
+            "",
+        ]
+        if structured_notes:
+            summary_block_lines.append("Structured summaries of compacted content:")
+            for note_text in structured_notes[:5]:  # top 5 only to save space
+                summary_block_lines.append(note_text)
+            if len(structured_notes) > 5:
+                summary_block_lines.append(
+                    f"... and {len(structured_notes) - 5} more summaries")
+        else:
+            # Legacy fallback — no tool outputs to summarize
+            summary_block_lines.append(
+                "[No structured summaries — compacted plain messages only.]")
+
         compaction_marker = {
             "role": "system",
-            "content": (
-                f"[Context compacted at {time.strftime('%H:%M:%S')}. "
-                f"Previous {stats.messages_count - len(filtered) - len(system_messages)} messages summarized. "
-                f"Token usage reduced from {stats.usage_percentage:.0f}% to "
-                f"{estimate_messages_tokens(filtered) / self.context_window * 100:.0f}%]"
-            ),
+            "content": "\n".join(summary_block_lines),
         }
-        
-        # Build final message list
+
         compacted = system_messages + [compaction_marker] + filtered
-        
-        # Record compaction
+
         self.compaction_history.append({
             "timestamp": time.time(),
             "before_tokens": stats.total_tokens,
-            "after_tokens": estimate_messages_tokens(compacted),
+            "after_tokens": after_tokens,
             "messages_removed": stats.messages_count - len(compacted),
+            "structured_notes_count": len(structured_notes),
+            "overflow_level": decision.suggested_action,
         })
-        
+
         self.messages = compacted
         return compacted
     

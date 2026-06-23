@@ -1,7 +1,7 @@
 from dataclasses import asdict
 
 from minicode.mcp import create_mcp_backed_tools
-from minicode.skills import discover_skills
+from minicode.skills import discover_skills_enriched
 from minicode.tooling import ToolRegistry
 from minicode.tools.api_tester import api_tester_tool
 from minicode.tools.ask_user import ask_user_tool
@@ -17,6 +17,7 @@ from minicode.tools.governance_audit_tool import governance_audit_tool
 from minicode.tools.grep_files import grep_files_tool
 from minicode.tools.list_files import list_files_tool
 from minicode.tools.load_skill import create_load_skill_tool
+from minicode.tools.spawn_agent import create_spawn_agent_tool
 from minicode.tools.modify_file import modify_file_tool
 from minicode.tools.multi_edit import multi_edit_tool
 from minicode.tools.notebook_edit import notebook_edit_tool
@@ -32,9 +33,10 @@ from minicode.tools.write_file import write_file_tool
 
 
 def create_default_tool_registry(cwd: str, runtime: dict | None = None) -> ToolRegistry:
-    skills = [asdict(skill) for skill in discover_skills(cwd)]
+    enriched = discover_skills_enriched(cwd)
+    skills = [asdict(s) for s in enriched]
     mcp = create_mcp_backed_tools(cwd=cwd, mcp_servers=dict(runtime.get("mcpServers", {})) if runtime else {})
-    return ToolRegistry(
+    registry = ToolRegistry(
         [
             # User interaction
             ask_user_tool,
@@ -77,6 +79,8 @@ def create_default_tool_registry(cwd: str, runtime: dict | None = None) -> ToolR
             governance_audit_tool,
             # Skills
             create_load_skill_tool(cwd),
+            # Multi-agent orchestration
+            create_spawn_agent_tool(cwd),
             # MCP tools
             *mcp["tools"],
         ],
@@ -84,3 +88,5 @@ def create_default_tool_registry(cwd: str, runtime: dict | None = None) -> ToolR
         mcp_servers=mcp["servers"],
         disposer=mcp["dispose"],
     )
+    registry.set_skill_objects(enriched)
+    return registry

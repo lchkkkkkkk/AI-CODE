@@ -207,7 +207,36 @@ def main() -> None:
     from minicode.memory import MemoryManager
     memory_mgr = MemoryManager(project_root=Path(cwd))
     logger.info("Memory manager initialized")
-    
+
+    # Initialize Skill Router for two-stage recall+ranking
+    from minicode.skill_router import SkillRouter
+    from minicode.skill_context import inspect_project_context
+    skill_router = SkillRouter(tools.get_skill_objects()) if tools.get_skill_objects() else None
+    logger.info("Skill router initialized with %d skills", len(tools.get_skill_objects()))
+
+    # Initialize self-evolving memory engine
+    from minicode.self_evolving_memory import MemoryEvolutionEngine, ExecutionTrace
+    evolution_engine = MemoryEvolutionEngine(memory_mgr)
+    turn_traces: list[ExecutionTrace] = []
+    turn_count = 0
+    logger.info("Self-evolving memory engine initialized")
+
+    # Initialize centralized multi-agent orchestrator
+    from minicode.agent_orchestrator import AgentOrchestrator
+    from minicode.tools.spawn_agent import set_orchestrator as set_spawn_orchestrator
+    agent_orchestrator = AgentOrchestrator(
+        model=model,
+        tools=tools,
+        cwd=cwd,
+    )
+    set_spawn_orchestrator(agent_orchestrator)
+    logger.info("Multi-agent orchestrator initialized")
+
+    # Initialize multi-layer security chain
+    from minicode.security_chain import SecurityChain
+    security_chain = SecurityChain(permissions)
+    logger.info("Security chain initialized (4 layers)")
+
     messages = [
         {
             "role": "system",
@@ -288,17 +317,58 @@ def main() -> None:
                 messages.append({"role": "user", "content": user_input})
                 history.append(user_input)
                 save_history_entries(history)
+
+                # Route skills based on user input
+                is_routed = False
+                routing_conf = None
+                routed_skills = tools.get_skills()
+                if skill_router is not None and user_input.strip():
+                    try:
+                        proj_ctx = inspect_project_context(cwd)
+                        ranked, conf = skill_router.route(
+                            user_input,
+                            proj_ctx.__dict__ if hasattr(proj_ctx, '__dict__') else {},
+                        )
+                        if conf >= 0.3 and len(ranked) > 0:
+                            from dataclasses import asdict as _asdict
+                            tools.set_routed_skills([_asdict(s) for s in ranked[:3]])
+                            routed_skills = tools.get_skills(routed_only=True)
+                            is_routed = True
+                            routing_conf = conf
+                        else:
+                            tools.set_routed_skills(None)
+                    except Exception:
+                        tools.set_routed_skills(None)
+
+                # Retrieve relevant past memories for this turn
+                relevant_memories = []
+                if memory_mgr is not None and user_input.strip():
+                    try:
+                        relevant_memories = memory_mgr.search_relevant(user_input, limit=5)
+                    except Exception:
+                        pass
+
                 messages[0] = {
                     "role": "system",
                     "content": build_system_prompt(
                         cwd,
                         permissions.get_summary(),
                         {
-                            "skills": tools.get_skills(),
+                            "skills": routed_skills,
                             "mcpServers": tools.get_mcp_servers(),
+                            "relevant_memories": relevant_memories,
                         },
+                        routing_confidence=routing_conf,
+                        is_routed=is_routed,
                     ),
                 }
+
+                # Self-evolving memory: capture traces
+                turn_traces.clear()
+
+                def on_trace_capture(trace: ExecutionTrace) -> None:
+                    turn_traces.append(trace)
+
                 permissions.begin_turn()
                 messages = run_agent_turn(
                     model=model,
@@ -307,9 +377,31 @@ def main() -> None:
                     cwd=cwd,
                     permissions=permissions,
                     context_manager=context_mgr,
+                    on_trace_capture=on_trace_capture,
+                    session_context={
+                        "session_id": getattr(memory_mgr, '_last_session_id', ''),
+                        "user_input": user_input,
+                    },
+                    security_chain=security_chain,
                 )
                 permissions.end_turn()
-                
+
+                # Self-evolving memory: reflect after turn
+                turn_count += 1
+                if turn_traces:
+                    try:
+                        results = evolution_engine.reflect_and_evolve(user_input)
+                        logger.debug("Memory evolution: %d results from %d traces",
+                                     len(results), len(turn_traces))
+                    except Exception as exc:
+                        logger.warning("Memory evolution failed: %s", exc)
+
+                # Periodic decay (every 20 turns)
+                if turn_count % 20 == 0:
+                    pruned = memory_mgr.apply_decay_all()
+                    if pruned:
+                        logger.info("Memory decay: %d low-confidence entries pruned", pruned)
+
                 # Log context usage after turn
                 if context_mgr:
                     stats = context_mgr.get_stats()
@@ -329,6 +421,7 @@ def main() -> None:
             permissions=permissions,
             resume_session=args.resume,
             list_sessions_only=args.list_sessions,
+            skill_router=skill_router,
         )
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Shutting down gracefully...")
@@ -341,6 +434,14 @@ def main() -> None:
         # Dispose tools (closes MCP connections)
         try:
             tools.dispose()
+        except Exception:
+            pass
+
+        # Cleanup agent worktrees
+        try:
+            agent_orchestrator.cleanup_worktrees()
+        except Exception:
+            pass
             logger.info("Tools disposed successfully")
         except Exception as e:
             logger.warning("Error disposing tools: %s", e)

@@ -167,6 +167,7 @@ class TtyAppArgs:
     messages: list[ChatMessage]
     cwd: str
     permissions: PermissionManager
+    skill_router: Any | None = None  # SkillRouter instance
 
 
 @dataclass
@@ -1087,16 +1088,40 @@ def _handle_input(
     aggregated_edit_by_key: dict[str, AggregatedEditProgress] = {}
     aggregated_edit_by_entry_id: dict[int, AggregatedEditProgress] = {}
 
-    # Refresh system prompt
+    # Refresh system prompt with skill routing
+    is_routed = False
+    routing_conf = None
+    routed_skills = args.tools.get_skills()
+    if hasattr(args, 'skill_router') and args.skill_router is not None and input_text.strip():
+        try:
+            from minicode.skill_context import inspect_project_context
+            proj_ctx = inspect_project_context(args.cwd)
+            ranked, conf = args.skill_router.route(
+                input_text,
+                proj_ctx.__dict__ if hasattr(proj_ctx, '__dict__') else {},
+            )
+            if conf >= 0.3 and len(ranked) > 0:
+                from dataclasses import asdict
+                args.tools.set_routed_skills([asdict(s) for s in ranked[:3]])
+                routed_skills = args.tools.get_skills(routed_only=True)
+                is_routed = True
+                routing_conf = conf
+            else:
+                args.tools.set_routed_skills(None)
+        except Exception:
+            args.tools.set_routed_skills(None)
+
     args.messages[0] = {
         "role": "system",
         "content": build_system_prompt(
             args.cwd,
             args.permissions.get_summary(),
             {
-                "skills": args.tools.get_skills(),
+                "skills": routed_skills,
                 "mcpServers": args.tools.get_mcp_servers(),
             },
+            routing_confidence=routing_conf,
+            is_routed=is_routed,
         ),
     }
     args.messages.append({"role": "user", "content": input_text})
@@ -1312,12 +1337,14 @@ def run_tty_app(
     permissions: PermissionManager,
     resume_session: str | None = None,
     list_sessions_only: bool = False,
+    skill_router: Any | None = None,
 ) -> list[ChatMessage]:
     """Event-driven full-screen TTY application, ported from the TypeScript version.
-    
+
     Args:
         resume_session: Session ID to resume, or "latest" for most recent
         list_sessions_only: If True, print session list and exit
+        skill_router: Optional SkillRouter for two-stage skill routing
     """
 
     args = TtyAppArgs(
@@ -1327,6 +1354,7 @@ def run_tty_app(
         messages=messages,
         cwd=cwd,
         permissions=permissions,
+        skill_router=skill_router,
     )
 
     # Session initialization

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from minicode.skill_frontmatter import SkillFrontmatter, parse_frontmatter
+
+logger = logging.getLogger("skills")
 
 
 @dataclass(slots=True)
@@ -12,14 +17,22 @@ class SkillSummary:
     description: str
     path: str
     source: str
+    layer: str  # no default here so LoadedSkill can add non-default fields
 
 
 @dataclass(slots=True)
 class LoadedSkill(SkillSummary):
-    content: str
+    content: str = ""
+    frontmatter: SkillFrontmatter | None = None
 
 
-def extract_description(markdown: str) -> str:
+def extract_description(markdown: str, frontmatter: SkillFrontmatter | None = None) -> str:
+    """Extract the first non-heading paragraph as description.
+
+    If *frontmatter* carries a description, it takes precedence.
+    """
+    if frontmatter and frontmatter.description:
+        return frontmatter.description
     normalized = markdown.replace("\r\n", "\n")
     paragraphs = [block.strip() for block in normalized.split("\n\n") if block.strip()]
     for block in paragraphs:
@@ -69,19 +82,106 @@ def _list_skill_dirs(root: Path, source: str) -> list[LoadedSkill]:
     return results
 
 
-def discover_skills(cwd: str | Path) -> list[SkillSummary]:
+_LAYER_DIRS = ("atomic", "workflow", "domain")
+
+
+def _scan_hierarchical(root: Path, source: str) -> list[LoadedSkill]:
+    """Scan *root* for both flat and layered skill directories.
+
+    Layered structure (new)::
+
+        root/atomic/<name>/SKILL.md     → layer="atomic"
+        root/workflow/<name>/SKILL.md   → layer="workflow"
+        root/domain/<name>/SKILL.md     → layer="domain"
+
+    Flat structure (legacy)::
+
+        root/<name>/SKILL.md            → layer="unknown"
+    """
+    if not root.exists():
+        return []
+    results: list[LoadedSkill] = []
+
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+
+        # ── layered: entry is a layer directory ──
+        if entry.name in _LAYER_DIRS:
+            layer = entry.name
+            for skill_dir in sorted(entry.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                skill_path = skill_dir / "SKILL.md"
+                if not skill_path.exists():
+                    continue
+                loaded = _load_skill_file(skill_path, skill_dir.name, source, layer)
+                results.append(loaded)
+            continue
+
+        # ── flat legacy: entry IS a skill directory ──
+        skill_path = entry / "SKILL.md"
+        if not skill_path.exists():
+            continue
+        loaded = _load_skill_file(skill_path, entry.name, source, "unknown")
+        results.append(loaded)
+
+    return results
+
+
+def _load_skill_file(skill_path: Path, name: str, source: str, layer: str) -> LoadedSkill:
+    """Read a SKILL.md file, parse frontmatter, and return a LoadedSkill."""
+    content = skill_path.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(content)
+    if fm:
+        if fm.name:
+            name = fm.name
+        if fm.layer and fm.layer != "unknown":
+            layer = fm.layer
+    desc = extract_description(body if fm else content, fm)
+    return LoadedSkill(
+        name=name,
+        description=desc,
+        path=str(skill_path),
+        source=source,
+        layer=layer,
+        content=content,
+        frontmatter=fm,
+    )
+
+
+def discover_skills_enriched(cwd: str | Path) -> list[LoadedSkill]:
+    """Discover all skills with full metadata (frontmatter, layer, content).
+
+    Returns ``list[LoadedSkill]`` carrying parsed frontmatter, layer
+    inferred from directory structure, and the raw markdown body.
+    Uses hierarchical scanning for new-style layouts while remaining
+    compatible with legacy flat directories.
+    """
     by_name: dict[str, LoadedSkill] = {}
     for root, source in _skill_roots(cwd):
-        for skill in _list_skill_dirs(root, source):
+        for skill in _scan_hierarchical(root, source):
             by_name.setdefault(skill.name, skill)
+    return list(by_name.values())
+
+
+def discover_skills(cwd: str | Path) -> list[SkillSummary]:
+    """Discover skills and return lightweight summaries (backward compat).
+
+    Delegates to :func:`discover_skills_enriched` internally, stripping
+    the ``content`` and ``frontmatter`` fields to keep the existing
+    API contract.
+    """
+    enriched = discover_skills_enriched(cwd)
     return [
         SkillSummary(
-            name=skill.name,
-            description=skill.description,
-            path=skill.path,
-            source=skill.source,
+            name=s.name,
+            description=s.description,
+            path=s.path,
+            source=s.source,
+            layer=s.layer,
         )
-        for skill in by_name.values()
+        for s in enriched
     ]
 
 
@@ -90,16 +190,28 @@ def load_skill(cwd: str | Path, name: str) -> LoadedSkill | None:
     if not normalized_name:
         return None
     for root, source in _skill_roots(cwd):
-        skill_path = root / normalized_name / "SKILL.md"
-        if skill_path.exists():
-            content = skill_path.read_text(encoding="utf-8")
-            return LoadedSkill(
-                name=normalized_name,
-                description=extract_description(content),
-                path=str(skill_path),
-                source=source,
-                content=content,
-            )
+        # Try layered paths first
+        for layer_dir in ("",) + _LAYER_DIRS:
+            base = root / layer_dir if layer_dir else root
+            skill_path = base / normalized_name / "SKILL.md"
+            if skill_path.exists():
+                content = skill_path.read_text(encoding="utf-8")
+                fm, body = parse_frontmatter(content)
+                layer = layer_dir if layer_dir else (
+                    fm.layer if fm and fm.layer != "unknown" else "unknown"
+                )
+
+                desc = extract_description(body if fm else content, fm)
+                effective_name = fm.name if fm and fm.name else normalized_name
+                return LoadedSkill(
+                    name=effective_name,
+                    description=desc,
+                    path=str(skill_path),
+                    source=source,
+                    layer=layer,
+                    content=content,
+                    frontmatter=fm,
+                )
     return None
 
 

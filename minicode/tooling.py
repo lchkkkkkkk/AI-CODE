@@ -18,11 +18,21 @@ class ToolCapability(str, Enum):
     REQUIRES_PERMISSION = "requires_permission"
 
 
+class RiskLevel(str, Enum):
+    """Tool self-declared risk level for the security chain."""
+    SAFE = "safe"             # read-only, no side effects (e.g. read_file, list_files)
+    LOW = "low"               # minor side effects (e.g. web_fetch)
+    MEDIUM = "medium"         # file modifications (e.g. edit_file, write_file)
+    HIGH = "high"             # shell execution (e.g. run_command)
+    CRITICAL = "critical"     # system-level danger (e.g. run_command with sudo)
+
+
 @dataclass
 class ToolMetadata:
-    """Tool metadata for classification and discovery.
-    
-    Inspired by Claude Code's Tool type definition.
+    """Tool metadata with self-inspection (Layer 2 of security chain).
+
+    Each tool declares its own risk profile — the security chain reads
+    these declarations and decides whether to escalate to higher layers.
     """
     name: str
     description: str
@@ -31,6 +41,11 @@ class ToolMetadata:
     is_enabled: bool = True
     max_result_size_chars: int = 10_000
     tags: list[str] = field(default_factory=list)
+    # Tool self-inspection fields (Layer 2)
+    risk_level: RiskLevel = RiskLevel.SAFE
+    requires_review: bool = False          # always ask human before executing
+    safety_hints: list[str] = field(default_factory=list)  # human-readable warnings
+    auto_approve_in_auto_mode: bool = False  # skip prompt in auto mode
     
     @property
     def is_read_only(self) -> bool:
@@ -118,6 +133,9 @@ class ToolDefinition:
     input_schema: dict[str, Any]
     validator: Validator
     run: Runner
+    risk_level: RiskLevel = RiskLevel.SAFE
+    requires_review: bool = False
+    safety_hints: list[str] = field(default_factory=list)
 
 
 class ToolRegistry:
@@ -132,12 +150,33 @@ class ToolRegistry:
         self._skills = skills or []
         self._mcp_servers = mcp_servers or []
         self._disposer = disposer
+        # Routing support
+        self._skill_objects: list[Any] = []  # list[LoadedSkill]
+        self._routed_skills: list[dict[str, Any]] | None = None
 
     def list(self) -> list[ToolDefinition]:
         return list(self._tools)
 
-    def get_skills(self) -> list[dict[str, Any]]:
+    def get_skills(self, routed_only: bool = False) -> list[dict[str, Any]]:
+        if routed_only and self._routed_skills is not None:
+            return list(self._routed_skills)
         return list(self._skills)
+
+    def get_all_skills(self) -> list[dict[str, Any]]:
+        """Always return all discovered skills (for /skills command)."""
+        return list(self._skills)
+
+    def get_skill_objects(self) -> list[Any]:
+        """Return raw LoadedSkill objects (for the router)."""
+        return list(self._skill_objects)
+
+    def set_skill_objects(self, skill_objects: list[Any]) -> None:
+        """Store LoadedSkill objects for routing."""
+        self._skill_objects = list(skill_objects)
+
+    def set_routed_skills(self, skills: list[dict[str, Any]] | None) -> None:
+        """Set skills selected by the router for this turn."""
+        self._routed_skills = list(skills) if skills is not None else None
 
     def get_mcp_servers(self) -> list[dict[str, Any]]:
         return list(self._mcp_servers)

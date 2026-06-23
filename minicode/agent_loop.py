@@ -5,7 +5,7 @@ from typing import Callable
 from minicode.context_manager import ContextManager, estimate_message_tokens
 from minicode.logging_config import get_logger
 from minicode.permissions import PermissionManager
-from minicode.tooling import ToolContext, ToolRegistry
+from minicode.tooling import ToolContext, ToolRegistry, ToolResult
 from minicode.types import AgentStep, ChatMessage, ModelAdapter
 
 logger = get_logger("agent_loop")
@@ -91,7 +91,10 @@ def run_agent_turn(
     on_tool_result: Callable[[str, str, bool], None] | None = None,
     on_assistant_message: Callable[[str], None] | None = None,
     on_progress_message: Callable[[str], None] | None = None,
+    on_trace_capture: Callable[[Any], None] | None = None,
     context_manager: ContextManager | None = None,
+    session_context: dict | None = None,
+    security_chain: Any | None = None,
 ) -> list[ChatMessage]:
     current_messages = list(messages)
     saw_tool_result = False
@@ -257,6 +260,42 @@ def run_agent_turn(
         for call in next_step.calls:
             if on_tool_start:
                 on_tool_start(call["toolName"], call["input"])
+
+            # ── Security chain: multi-layer review before execution ──
+            if security_chain is not None and call["toolName"]:
+                tool_def = tools.find(call["toolName"])
+                if tool_def is not None:
+                    sess_ctx = session_context or {}
+                    sec_report = security_chain.review_tool_call(
+                        tool_def, call["input"],
+                        sess_ctx.get("user_input", ""), cwd,
+                    )
+                    if sec_report.verdict == "block":
+                        result = ToolResult(
+                            ok=False,
+                            output=f"Security blocked: {sec_report.reason}",
+                        )
+                        saw_tool_result = True
+                        tool_error_count += 1
+                        current_messages.append({
+                            "role": "assistant_tool_call",
+                            "toolUseId": call["id"],
+                            "toolName": call["toolName"],
+                            "input": call["input"],
+                        })
+                        current_messages.append({
+                            "role": "tool_result",
+                            "toolUseId": call["id"],
+                            "toolName": call["toolName"],
+                            "content": result.output,
+                            "isError": True,
+                            "offloaded": False,
+                            "security_blocked": True,
+                        })
+                        if on_tool_result:
+                            on_tool_result(call["toolName"], result.output, True)
+                        continue  # skip execution for this tool call
+
             result = tools.execute(
                 call["toolName"],
                 call["input"],
@@ -267,6 +306,38 @@ def run_agent_turn(
             saw_tool_result = True
             if not result.ok:
                 tool_error_count += 1
+
+            # ── Layered context compression: offload large tool results ──
+            result_content = result.output
+            offloaded = False
+            try:
+                from minicode.layered_context import ToolResultStorage
+                sess_ctx = session_context or {}
+                storage = ToolResultStorage(
+                    session_id=sess_ctx.get("session_id", ""))
+                if storage.should_offload(result.output):
+                    offloaded_result = storage.offload(
+                        call["toolName"], call["id"], result.output)
+                    result_content = storage.build_preview_message(offloaded_result)
+                    offloaded = True
+            except Exception:
+                pass  # offloading failure must never block the agent loop
+
+            # Self-evolving memory: capture execution trace
+            if on_trace_capture:
+                try:
+                    from minicode.self_evolving_memory import ExecutionTrace
+                    sess_ctx2 = session_context or {}
+                    on_trace_capture(ExecutionTrace(
+                        tool_name=call["toolName"],
+                        tool_input=call["input"],
+                        tool_output=result.output,
+                        is_error=not result.ok,
+                        session_id=sess_ctx2.get("session_id", ""),
+                        user_input_context=sess_ctx2.get("user_input", ""),
+                    ))
+                except Exception:
+                    pass  # trace capture must never break the agent loop
             current_messages.append(
                 {
                     "role": "assistant_tool_call",
@@ -280,8 +351,9 @@ def run_agent_turn(
                     "role": "tool_result",
                     "toolUseId": call["id"],
                     "toolName": call["toolName"],
-                    "content": result.output,
+                    "content": result_content,
                     "isError": not result.ok,
+                    "offloaded": offloaded,
                 }
             )
             if result.awaitUser:
