@@ -7,6 +7,8 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge)](LICENSE)
 [![Dependencies: 0](https://img.shields.io/badge/dependencies-0-f97316?style=for-the-badge)](pyproject.toml)
+[![AI: Claude](https://img.shields.io/badge/AI-Claude-FF6B35?style=for-the-badge&logo=anthropic&logoColor=white)](https://claude.ai)
+[![AI: DeepSeek](https://img.shields.io/badge/AI-DeepSeek-4F46E5?style=for-the-badge)](https://deepseek.com)
 [![Tests: 98.9%](https://img.shields.io/badge/tests-98.9%25-22c55e?style=for-the-badge)](tests/)
 
 [![Readability: 9/10](https://img.shields.io/badge/readability-9%2F10-4F46E5?style=for-the-badge)](docs/)
@@ -438,6 +440,8 @@ MIT — see [LICENSE](LICENSE) for details.
 <div align="center">
 
 **🇨🇳 由 [@QUSETIONS](https://github.com/QUSETIONS) 用 ❤️ 制作** | **🇺🇸 Made with ❤️ by [@QUSETIONS](https://github.com/QUSETIONS)**
+
+**🤖 AI 贡献者 / AI Contributors: [Claude](https://claude.ai) · [DeepSeek](https://deepseek.com)**
 
 *轻量终端 AI 编程助手 / Lightweight Terminal AI Coding Assistant*
 
